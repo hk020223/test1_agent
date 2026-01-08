@@ -12,7 +12,7 @@ from PIL import Image
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import PromptTemplate
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 
 # Firebase 라이브러리
 import firebase_admin
@@ -23,33 +23,48 @@ from firebase_admin import credentials, firestore
 # -----------------------------------------------------------------------------
 st.set_page_config(page_title="KW-AI Agent", page_icon="🤖", layout="wide")
 
-# 모바일 최적화 CSS
+# 모바일 최적화 및 UI 개선 CSS
 st.markdown("""
     <style>
         footer { visibility: hidden; }
+        
+        /* 모바일 최적화 */
         @media only screen and (max-width: 600px) {
             .main .block-container {
-                padding-left: 0.2rem !important;
-                padding-right: 0.2rem !important;
+                padding-left: 0.5rem !important;
+                padding-right: 0.5rem !important;
                 padding-top: 2rem !important;
                 max-width: 100% !important;
             }
+            
+            /* 시간표 테이블 모바일 스타일 */
             div[data-testid="stMarkdownContainer"] table {
                 width: 100% !important;
                 table-layout: fixed !important;
                 display: table !important;
-                font-size: 10px !important;
+                font-size: 11px !important;
                 margin-bottom: 0px !important;
             }
+            
             div[data-testid="stMarkdownContainer"] th, 
             div[data-testid="stMarkdownContainer"] td {
-                padding: 1px 1px !important;
+                padding: 2px !important;
                 word-wrap: break-word !important;
                 word-break: break-all !important;
                 white-space: normal !important;
-                line-height: 1.1 !important;
+                line-height: 1.2 !important;
                 vertical-align: middle !important;
             }
+            
+            /* 교시 열 너비 고정 */
+            div[data-testid="stMarkdownContainer"] th:first-child,
+            div[data-testid="stMarkdownContainer"] td:first-child {
+                width: 40px !important;
+                font-size: 9px !important;
+                text-align: center !important;
+                background-color: #f8f9fa;
+            }
+            
             button { min-height: 45px !important; }
             input { font-size: 16px !important; }
         }
@@ -91,6 +106,7 @@ class FirebaseManager:
             return None, "API Key Error"
         api_key = st.secrets["FIREBASE_WEB_API_KEY"].strip()
         endpoint = "signInWithPassword" if mode == "login" else "signUp"
+        # URL 형식 수정 완료
         url = f"https://identitytoolkit.googleapis.com/v1/accounts:{endpoint}?key={api_key}"
         try:
             res = requests.post(url, json={"email": email, "password": password, "returnSecureToken": True})
@@ -99,7 +115,7 @@ class FirebaseManager:
             return data, None
         except Exception as e: return None, str(e)
 
-    # 사용자 프로필(학과, 학년 등) 저장/로드
+    # 사용자 프로필(학과, 학년 등) 저장
     def save_profile(self, profile_data):
         if not self.is_initialized or not st.session_state.user: return
         try:
@@ -107,6 +123,7 @@ class FirebaseManager:
             self.db.collection('users').document(uid).collection('profile').document('info').set(profile_data)
         except: pass
 
+    # 사용자 프로필 불러오기
     def load_profile(self):
         if not self.is_initialized or not st.session_state.user: return None
         try:
@@ -120,13 +137,16 @@ class FirebaseManager:
         if not self.is_initialized or not st.session_state.user: return
         try:
             uid = st.session_state.user['localId']
+            # 최근 20개 대화만 저장 (용량 최적화)
+            save_data = [{"role": m["role"], "content": m["content"], "type": m.get("type", "text")} for m in messages[-20:]]
             self.db.collection('users').document(uid).collection('chat_sessions').document(session_id).set({
-                "messages": messages,
+                "messages": save_data,
                 "summary": summary,
                 "updated_at": firestore.SERVER_TIMESTAMP
-            })
+            }, merge=True)
         except: pass
 
+    # 채팅 히스토리 목록 로드
     def load_chat_history_list(self):
         if not self.is_initialized or not st.session_state.user: return []
         try:
@@ -136,7 +156,7 @@ class FirebaseManager:
             return [{"id": d.id, **d.to_dict()} for d in docs]
         except: return []
 
-    # 보관함(Bookmark) 저장/로드
+    # 보관함(Bookmark) 저장
     def add_bookmark(self, type, content, note=""):
         if not self.is_initialized or not st.session_state.user: return False
         try:
@@ -148,6 +168,7 @@ class FirebaseManager:
             return True
         except: return False
     
+    # 보관함 로드
     def load_bookmarks(self):
         if not self.is_initialized or not st.session_state.user: return []
         try:
@@ -170,7 +191,6 @@ if "user_profile" not in st.session_state:
         "major": "전자융합공학과", "grade": "1학년", "semester": "1학기", 
         "credit": 18, "requirements": "", "blocked_days": []
     }
-# 졸업 진단용 성적표 이미지 (Base64)
 if "grade_card_img" not in st.session_state: st.session_state.grade_card_img = []
 
 # HTML 정제 함수
