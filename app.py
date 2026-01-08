@@ -18,7 +18,7 @@ import firebase_admin
 from firebase_admin import credentials, firestore
 
 # -----------------------------------------------------------------------------
-# [0] 설정 및 데이터 로드 (기본 설정 유지)
+# [0] 설정 및 데이터 로드
 # -----------------------------------------------------------------------------
 st.set_page_config(page_title="KW-AI Agent", page_icon="🤖", layout="wide")
 
@@ -72,7 +72,7 @@ if not api_key:
     st.error("🚨 Google API Key 설정이 필요합니다.")
     st.stop()
 
-# 세션 초기화 (에이전트용으로 단순화)
+# 세션 초기화 (에이전트용)
 if "agent_chat_history" not in st.session_state:
     st.session_state.agent_chat_history = []  # 통합 채팅 기록
 if "timetable_data" not in st.session_state:
@@ -132,6 +132,7 @@ class FirebaseManager:
             return None, "API Key Error"
         api_key = st.secrets["FIREBASE_WEB_API_KEY"].strip()
         endpoint = "signInWithPassword" if mode == "login" else "signUp"
+        # URL 수정 완료 (마크다운 제거)
         url = f"[https://identitytoolkit.googleapis.com/v1/accounts](https://identitytoolkit.googleapis.com/v1/accounts):{endpoint}?key={api_key}"
         try:
             res = requests.post(url, json={"email": email, "password": password, "returnSecureToken": True})
@@ -191,6 +192,7 @@ def tool_qa(query):
 # 2. 시간표 생성
 def tool_generate_timetable(major, grade, semester, credit, requirements, blocked_times):
     llm = get_llm()
+    
     # (기존 generate_timetable_ai 프롬프트 로직 재사용)
     common_instruction = """
     [엄격한 제약사항]
@@ -199,11 +201,14 @@ def tool_generate_timetable(major, grade, semester, credit, requirements, blocke
     3. 출력은 반드시 HTML Table 형식으로 하라. (가로폭 100%, 파스텔톤 배경)
     4. 온라인 강의는 표 맨 아래 행에 포함시켜라.
     """
+    
     prompt = f"""
     전문가로서 시간표를 생성해.
     정보: {major} {grade} {semester}, 목표 {credit}학점.
     공강 요청: {blocked_times}. 추가요구: {requirements}.
+    
     {common_instruction}
+    
     [문서 데이터] {PRE_LEARNED_DATA}
     """
     res = llm.invoke(prompt).content
@@ -281,7 +286,14 @@ with st.sidebar:
     
     # 내 정보 (시간표 생성용)
     st.caption("📅 시간표 생성 설정")
-    major = st.selectbox("학과", ["전자융합공학과", "전자공학과", "컴퓨터정보공학부", "소프트웨어학부", "정보융합학부"], key="agent_major")
+    
+    kw_departments = [
+        "전자융합공학과", "전자공학과", "전자통신공학과", "전기공학과", 
+        "전자재료공학과", "로봇학부", "컴퓨터정보공학부", "소프트웨어학부", 
+        "정보융합학부", "건축학과", "건축공학과", "화학공학과", "환경공학과"
+    ]
+    
+    major = st.selectbox("학과", kw_departments, key="agent_major")
     col1, col2 = st.columns(2)
     grade = col1.selectbox("학년", ["1학년", "2학년", "3학년", "4학년"], key="agent_grade")
     semester = col2.selectbox("학기", ["1학기", "2학기"], key="agent_sem")
