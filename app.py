@@ -7,6 +7,7 @@ import time
 import base64
 import json
 import uuid
+import requests
 import ast
 from PIL import Image
 from langchain_community.document_loaders import PyPDFLoader
@@ -91,7 +92,7 @@ def run_with_retry(func, *args, **kwargs):
         raise e
 
 # -----------------------------------------------------------------------------
-# [Firebase Manager] (Identity Toolkit 제거 -> Firestore 직접 인증)
+# [Firebase Manager]
 # -----------------------------------------------------------------------------
 class FirebaseManager:
     def __init__(self):
@@ -110,12 +111,11 @@ class FirebaseManager:
                 self.is_initialized = True
             except: pass
 
-    # [수정됨] Firestore를 이용한 자체 간편 인증 (Identity Toolkit 미사용)
+    # Firestore를 이용한 자체 간편 인증
     def auth_user(self, email, password, mode="login"):
         if not self.is_initialized:
             return None, "Firebase DB가 연결되지 않았습니다."
         
-        # 이메일을 문서 ID로 사용하기 위해 특수문자 처리 (간소화)
         user_id = email.replace("@", "_at_").replace(".", "_dot_")
         doc_ref = self.db.collection('users').document(user_id)
 
@@ -125,7 +125,6 @@ class FirebaseManager:
             if mode == "signup":
                 if doc.exists:
                     return None, "이미 존재하는 이메일입니다."
-                # 회원가입: 비밀번호 저장 (실제 서비스에선 해싱 필요하지만 여기선 평문 저장)
                 doc_ref.set({"password": password, "email": email, "created_at": firestore.SERVER_TIMESTAMP})
                 return {"localId": user_id, "email": email}, None
             
@@ -282,7 +281,7 @@ def tool_audit_graduation(profile, images_b64):
         return "🎓 졸업 진단을 위해 사이드바에서 성적표 이미지를 업로드해주세요."
     
     llm = get_llm()
-    image_content = [{"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img}"}} for img in images_b64]
+    img_content = [{"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img}"}} for img in images_b64]
     
     prompt_text = f"""
     학생: {profile['major']} {profile['grade']}
@@ -304,7 +303,9 @@ def route_intent(user_input):
     """
     res = run_with_retry(lambda: llm.invoke(prompt).content.strip())
     try:
-        if "[" in res and "]" in res: return ast.literal_eval(res)
+        # 응답이 리스트 형태 문자열인지 확인하고 파싱
+        if "[" in res and "]" in res:
+            return ast.literal_eval(res)
         return [res]
     except: return ["CHAT"]
 
@@ -317,6 +318,7 @@ with st.sidebar:
     # 로그인
     if st.session_state.user:
         st.success(f"**{st.session_state.user['email']}**님")
+        # [수정] 로그아웃 시 확실한 초기화
         if st.button("로그아웃", use_container_width=True):
             st.session_state.user = None
             st.session_state.clear()
@@ -340,10 +342,10 @@ with st.sidebar:
                     st.session_state.user = user
                     st.rerun()
                 else: st.error(err)
-
+    
     st.divider()
     
-    # 내 정보 설정 (UI 복원)
+    # 내 정보 설정
     st.subheader("📅 시간표 및 학사 설정")
     st.caption("이 정보는 시간표, 졸업진단, 질문 답변 시 AI가 참고합니다.")
     
@@ -396,9 +398,9 @@ with st.sidebar:
 
     st.divider()
 
-    # 히스토리 & 보관함 탭
+    # 히스토리 & 보관함 탭 (변수명 수정: t1, t2 -> tab1, tab2)
     tab1, tab2 = st.tabs(["🗂️ 히스토리", "⭐ 보관함"])
-    with t1:
+    with tab1:
         if st.session_state.user:
             for h in fb_manager.load_chat_history_list():
                 dt = h['updated_at'].strftime('%m/%d %H:%M') if h.get('updated_at') else ""
@@ -407,7 +409,7 @@ with st.sidebar:
                     st.rerun()
         else: st.caption("로그인 필요")
         
-    with t2:
+    with tab2:
         if st.session_state.user:
             for b in fb_manager.load_bookmarks():
                 with st.expander(f"📌 {b.get('note', '항목')}"):
