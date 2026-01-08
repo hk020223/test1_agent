@@ -1,9 +1,9 @@
 streamlit
 pandas
-langchain-google-genai
 langchain-community
 langchain-core
+langchain-google-genai
 pypdf
-Pillow
 firebase-admin
 requests
+Pillow
