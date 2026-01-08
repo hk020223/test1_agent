@@ -119,7 +119,7 @@ class FirebaseManager:
         if "FIREBASE_WEB_API_KEY" not in st.secrets: return None, "API Key Error"
         web_api_key = st.secrets["FIREBASE_WEB_API_KEY"].strip()
         endpoint = "signInWithPassword" if mode == "login" else "signUp"
-        url = f"[https://identitytoolkit.googleapis.com/v1/accounts](https://identitytoolkit.googleapis.com/v1/accounts):{endpoint}?key={web_api_key}"
+        url = f"https://identitytoolkit.googleapis.com/v1/accounts:{endpoint}?key={api_key}"
         try:
             res = requests.post(url, json={"email": email, "password": password, "returnSecureToken": True})
             data = res.json()
