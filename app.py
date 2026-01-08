@@ -84,15 +84,12 @@ def clean_html_output(text):
 
 # 재시도 로직 (429 에러 대응 - 즉시 알림)
 def run_with_retry(func, *args, **kwargs):
-    max_retries = 3
-    for i in range(max_retries):
-        try:
-            return func(*args, **kwargs)
-        except Exception as e:
-            if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
-                return "⚠️ **사용량 초과**: 현재 AI 요청량이 많아 처리가 불가능합니다. 잠시 후(약 1분 뒤) 다시 질문해 주세요."
-            raise e
-    return "⚠️ 처리 실패: 다시 시도해주세요."
+    try:
+        return func(*args, **kwargs)
+    except Exception as e:
+        if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
+            return "⚠️ **사용량 초과**: 현재 AI 요청량이 많아 처리가 불가능합니다. 잠시 후(약 1분 뒤) 다시 질문해 주세요."
+        raise e
 
 # -----------------------------------------------------------------------------
 # [Firebase Manager]
@@ -115,21 +112,21 @@ class FirebaseManager:
             except: pass
 
     def auth_user(self, email, password, mode="login"):
-        if not self.is_initialized: return None, "DB 미연결"
-        user_id = email.replace("@", "_at_").replace(".", "_dot_")
-        doc_ref = self.db.collection('users').document(user_id)
+        if "FIREBASE_WEB_API_KEY" not in st.secrets: return None, "API Key Error"
+        web_api_key = st.secrets["FIREBASE_WEB_API_KEY"].strip()
+        endpoint = "signInWithPassword" if mode == "login" else "signUp"
+        url = f"[https://identitytoolkit.googleapis.com/v1/accounts](https://identitytoolkit.googleapis.com/v1/accounts):{endpoint}?key={web_api_key}"
         try:
-            doc = doc_ref.get()
-            if mode == "signup":
-                if doc.exists: return None, "이미 존재하는 이메일입니다."
-                doc_ref.set({"password": password, "email": email, "created_at": firestore.SERVER_TIMESTAMP})
-                return {"localId": user_id, "email": email}, None
-            elif mode == "login":
-                if not doc.exists: return None, "존재하지 않는 사용자입니다."
-                user_data = doc.to_dict()
-                if user_data.get("password") == password:
-                    return {"localId": user_id, "email": email}, None
-                else: return None, "비밀번호 오류"
+            res = requests.post(url, json={"email": email, "password": password, "returnSecureToken": True})
+            data = res.json()
+            if "error" in data:
+                msg = data["error"]["message"]
+                if "Identity Toolkit API has not been used" in msg or "disabled" in msg:
+                    project_id = st.secrets.get("firebase_service_account", {}).get("project_id", "")
+                    link = f"https://console.developers.google.com/apis/api/identitytoolkit.googleapis.com/overview?project={project_id}"
+                    return None, f"🚨 **구글 클라우드 설정 필요**\n\n아래 링크에서 [사용(ENABLE)] 버튼을 눌러주세요.\n[설정 바로가기]({link})"
+                return None, msg
+            return data, None
         except Exception as e: return None, str(e)
 
     def save_profile(self, profile_data, imgs_b64):
@@ -197,17 +194,17 @@ class FirebaseManager:
 fb_manager = FirebaseManager()
 
 # -----------------------------------------------------------------------------
-# [Session State] 초기화
+# [Session & Data]
 # -----------------------------------------------------------------------------
 if "user" not in st.session_state: st.session_state.user = None
 if "current_chat" not in st.session_state: st.session_state.current_chat = []
 if "session_id" not in st.session_state: st.session_state.session_id = str(uuid.uuid4())
 
-# 초기값을 빈 값으로 설정
+# 초기값을 빈 값으로 설정 (기본 학점 19로 변경)
 if "user_profile" not in st.session_state:
     st.session_state.user_profile = {
         "major": "선택해주세요", "grade": "선택해주세요", "semester": "선택해주세요", 
-        "credit": 0, "requirements": "", "blocked_days": []
+        "credit": 19, "requirements": "", "blocked_days": []
     }
 if "grade_card_img" not in st.session_state: st.session_state.grade_card_img = []
 if "timetable_data" not in st.session_state: st.session_state.timetable_data = ""
@@ -303,8 +300,7 @@ def route_intent(user_input):
     """
     res = run_with_retry(lambda: llm.invoke(prompt).content.strip())
     try:
-        if "[" in res and "]" in res:
-            return ast.literal_eval(res)
+        if "[" in res and "]" in res: return ast.literal_eval(res)
         return [res]
     except: return ["CHAT"]
 
@@ -329,11 +325,25 @@ with st.sidebar:
                 user, err = fb_manager.auth_user(email, pw, "login")
                 if user:
                     st.session_state.user = user
+                    # 로그인 시 프로필 로드 및 세션/위젯 상태 동기화
                     saved = fb_manager.load_profile()
                     if saved:
                         st.session_state.user_profile.update(saved)
                         if 'grade_card_img' in saved:
                             st.session_state.grade_card_img = saved['grade_card_img']
+                        
+                        # [핵심] 위젯 키값 강제 업데이트
+                        if "major" in saved: st.session_state.agent_major = saved["major"]
+                        if "grade" in saved: st.session_state.agent_grade = saved["grade"]
+                        if "semester" in saved: st.session_state.agent_sem = saved["semester"]
+                        if "credit" in saved: st.session_state.agent_credit = saved["credit"]
+                        if "requirements" in saved: st.session_state.agent_reqs = saved["requirements"]
+                        
+                        # 공강 체크박스 동기화
+                        blocked_days = saved.get("blocked_days", [])
+                        for d in ["월", "화", "수", "목", "금"]:
+                            st.session_state[f"chk_{d}"] = (d not in blocked_days)
+                            
                     st.rerun()
                 else: st.error(err)
             if col_l2.button("가입"):
@@ -342,7 +352,7 @@ with st.sidebar:
                     st.session_state.user = user
                     st.rerun()
                 else: st.error(err)
-
+    
     st.divider()
     
     # 내 정보 설정
@@ -351,6 +361,7 @@ with st.sidebar:
     
     kw_depts = ["선택해주세요", "전자융합공학과", "전자공학과", "컴퓨터정보공학부", "소프트웨어학부", "정보융합학부", "경영학부"]
     
+    # 세션 값으로 초기값 설정
     p = st.session_state.user_profile
     
     # 인덱스 에러 방지
@@ -375,6 +386,7 @@ with st.sidebar:
         new_blocked = []
         cols = st.columns(5)
         for i, d in enumerate(days):
+            # p["blocked_days"]에 있으면 체크 해제 상태
             is_checked = d not in p["blocked_days"]
             if not cols[i].checkbox(d, value=is_checked, key=f"chk_{d}"):
                 new_blocked.append(d)
