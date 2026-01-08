@@ -115,21 +115,21 @@ class FirebaseManager:
             except: pass
 
     def auth_user(self, email, password, mode="login"):
-        if "FIREBASE_WEB_API_KEY" not in st.secrets: return None, "API Key Error"
-        web_api_key = st.secrets["FIREBASE_WEB_API_KEY"].strip()
-        endpoint = "signInWithPassword" if mode == "login" else "signUp"
-        url = url = f"https://identitytoolkit.googleapis.com/v1/accounts:{endpoint}?key={api_key}"
+        if not self.is_initialized: return None, "DB 미연결"
+        user_id = email.replace("@", "_at_").replace(".", "_dot_")
+        doc_ref = self.db.collection('users').document(user_id)
         try:
-            res = requests.post(url, json={"email": email, "password": password, "returnSecureToken": True})
-            data = res.json()
-            if "error" in data:
-                msg = data["error"]["message"]
-                if "Identity Toolkit API has not been used" in msg or "disabled" in msg:
-                    project_id = st.secrets.get("firebase_service_account", {}).get("project_id", "")
-                    link = f"https://console.developers.google.com/apis/api/identitytoolkit.googleapis.com/overview?project={project_id}"
-                    return None, f"🚨 **구글 클라우드 설정 필요**\n\n아래 링크에서 [사용(ENABLE)] 버튼을 눌러주세요.\n[설정 바로가기]({link})"
-                return None, msg
-            return data, None
+            doc = doc_ref.get()
+            if mode == "signup":
+                if doc.exists: return None, "이미 존재하는 이메일입니다."
+                doc_ref.set({"password": password, "email": email, "created_at": firestore.SERVER_TIMESTAMP})
+                return {"localId": user_id, "email": email}, None
+            elif mode == "login":
+                if not doc.exists: return None, "존재하지 않는 사용자입니다."
+                user_data = doc.to_dict()
+                if user_data.get("password") == password:
+                    return {"localId": user_id, "email": email}, None
+                else: return None, "비밀번호 오류"
         except Exception as e: return None, str(e)
 
     def save_profile(self, profile_data, imgs_b64):
@@ -197,7 +197,7 @@ class FirebaseManager:
 fb_manager = FirebaseManager()
 
 # -----------------------------------------------------------------------------
-# [Session & Data]
+# [Session State] 초기화
 # -----------------------------------------------------------------------------
 if "user" not in st.session_state: st.session_state.user = None
 if "current_chat" not in st.session_state: st.session_state.current_chat = []
@@ -303,7 +303,8 @@ def route_intent(user_input):
     """
     res = run_with_retry(lambda: llm.invoke(prompt).content.strip())
     try:
-        if "[" in res and "]" in res: return ast.literal_eval(res)
+        if "[" in res and "]" in res:
+            return ast.literal_eval(res)
         return [res]
     except: return ["CHAT"]
 
@@ -408,8 +409,8 @@ with st.sidebar:
     st.divider()
 
     # 히스토리 & 보관함
-    tab1, tab2 = st.tabs(["🗂️ 히스토리", "⭐ 보관함"])
-    with tab1:
+    t1, t2 = st.tabs(["🗂️ 히스토리", "⭐ 보관함"])
+    with t1:
         if st.session_state.user:
             for h in fb_manager.load_chat_history_list():
                 dt = h['updated_at'].strftime('%m/%d %H:%M') if h.get('updated_at') else ""
@@ -418,7 +419,7 @@ with st.sidebar:
                     st.rerun()
         else: st.caption("로그인 필요")
         
-    with tab2:
+    with t2:
         if st.session_state.user:
             for b in fb_manager.load_bookmarks():
                 with st.expander(f"📌 {b.get('note', '항목')}"):
