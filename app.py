@@ -7,7 +7,6 @@ import time
 import base64
 import json
 import uuid
-import requests
 import ast
 from PIL import Image
 from langchain_community.document_loaders import PyPDFLoader
@@ -92,7 +91,7 @@ def run_with_retry(func, *args, **kwargs):
         raise e
 
 # -----------------------------------------------------------------------------
-# [Firebase Manager]
+# [Firebase Manager] (Identity Toolkit 제거 -> Firestore 직접 인증)
 # -----------------------------------------------------------------------------
 class FirebaseManager:
     def __init__(self):
@@ -111,24 +110,35 @@ class FirebaseManager:
                 self.is_initialized = True
             except: pass
 
+    # [수정됨] Firestore를 이용한 자체 간편 인증 (Identity Toolkit 미사용)
     def auth_user(self, email, password, mode="login"):
-        if "FIREBASE_WEB_API_KEY" not in st.secrets: return None, "API Key Error"
-        web_api_key = st.secrets["FIREBASE_WEB_API_KEY"].strip()
-        endpoint = "signInWithPassword" if mode == "login" else "signUp"
-        # URL 형식 수정 완료
-        url = f"https://identitytoolkit.googleapis.com/v1/accounts:{endpoint}?key={api_key}"
+        if not self.is_initialized:
+            return None, "Firebase DB가 연결되지 않았습니다."
+        
+        # 이메일을 문서 ID로 사용하기 위해 특수문자 처리 (간소화)
+        user_id = email.replace("@", "_at_").replace(".", "_dot_")
+        doc_ref = self.db.collection('users').document(user_id)
+
         try:
-            res = requests.post(url, json={"email": email, "password": password, "returnSecureToken": True})
-            data = res.json()
-            if "error" in data:
-                msg = data["error"]["message"]
-                if "Identity Toolkit API has not been used" in msg or "disabled" in msg:
-                    project_id = st.secrets.get("firebase_service_account", {}).get("project_id", "")
-                    link = f"https://console.developers.google.com/apis/api/identitytoolkit.googleapis.com/overview?project={project_id}"
-                    return None, f"🚨 **구글 클라우드 설정 필요**\n\n아래 링크에서 [사용(ENABLE)] 버튼을 눌러주세요.\n[설정 바로가기]({link})"
-                return None, msg
-            return data, None
-        except Exception as e: return None, str(e)
+            doc = doc_ref.get()
+            
+            if mode == "signup":
+                if doc.exists:
+                    return None, "이미 존재하는 이메일입니다."
+                # 회원가입: 비밀번호 저장 (실제 서비스에선 해싱 필요하지만 여기선 평문 저장)
+                doc_ref.set({"password": password, "email": email, "created_at": firestore.SERVER_TIMESTAMP})
+                return {"localId": user_id, "email": email}, None
+            
+            elif mode == "login":
+                if not doc.exists:
+                    return None, "존재하지 않는 사용자입니다."
+                user_data = doc.to_dict()
+                if user_data.get("password") == password:
+                    return {"localId": user_id, "email": email}, None
+                else:
+                    return None, "비밀번호가 틀렸습니다."
+        except Exception as e:
+            return None, str(e)
 
     def save_profile(self, profile_data):
         if self.is_initialized and st.session_state.user:
@@ -272,7 +282,7 @@ def tool_audit_graduation(profile, images_b64):
         return "🎓 졸업 진단을 위해 사이드바에서 성적표 이미지를 업로드해주세요."
     
     llm = get_llm()
-    img_content = [{"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img}"}} for img in images_b64]
+    image_content = [{"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img}"}} for img in images_b64]
     
     prompt_text = f"""
     학생: {profile['major']} {profile['grade']}
@@ -307,8 +317,8 @@ with st.sidebar:
     # 로그인
     if st.session_state.user:
         st.success(f"**{st.session_state.user['email']}**님")
-        # [수정] 로그아웃 시 확실한 초기화
         if st.button("로그아웃", use_container_width=True):
+            st.session_state.user = None
             st.session_state.clear()
             st.rerun()
     else:
@@ -333,7 +343,7 @@ with st.sidebar:
 
     st.divider()
     
-    # 내 정보 설정 (UI 복원: 펼쳐진 형태)
+    # 내 정보 설정 (UI 복원)
     st.subheader("📅 시간표 및 학사 설정")
     st.caption("이 정보는 시간표, 졸업진단, 질문 답변 시 AI가 참고합니다.")
     
@@ -386,8 +396,8 @@ with st.sidebar:
 
     st.divider()
 
-    # 히스토리 & 보관함
-    t1, t2 = st.tabs(["🗂️ 히스토리", "⭐ 보관함"])
+    # 히스토리 & 보관함 탭
+    tab1, tab2 = st.tabs(["🗂️ 히스토리", "⭐ 보관함"])
     with t1:
         if st.session_state.user:
             for h in fb_manager.load_chat_history_list():
