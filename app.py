@@ -133,7 +133,7 @@ class FirebaseManager:
         api_key = st.secrets["FIREBASE_WEB_API_KEY"].strip()
         endpoint = "signInWithPassword" if mode == "login" else "signUp"
         # URL 수정 완료 (마크다운 제거)
-        url = f"[https://identitytoolkit.googleapis.com/v1/accounts](https://identitytoolkit.googleapis.com/v1/accounts):{endpoint}?key={api_key}"
+        url = f"https://identitytoolkit.googleapis.com/v1/accounts:{endpoint}?key={api_key}"
         try:
             res = requests.post(url, json={"email": email, "password": password, "returnSecureToken": True})
             data = res.json()
@@ -385,3 +385,4 @@ if prompt := st.chat_input("예: 1학년 시간표 짜줘, 졸업 가능한지 �
             # 로그인 시 자동 클라우드 백업
             if st.session_state.user:
                 fb_manager.save_chat(st.session_state.agent_chat_history)
+
