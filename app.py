@@ -111,23 +111,33 @@ class FirebaseManager:
                 self.is_initialized = True
             except: pass
 
+    # Firestore를 이용한 자체 간편 인증
     def auth_user(self, email, password, mode="login"):
-        if "FIREBASE_WEB_API_KEY" not in st.secrets: return None, "API Key Error"
-        web_api_key = st.secrets["FIREBASE_WEB_API_KEY"].strip()
-        endpoint = "signInWithPassword" if mode == "login" else "signUp"
-        url = f"https://identitytoolkit.googleapis.com/v1/accounts:{endpoint}?key={api_key}"
+        if not self.is_initialized:
+            return None, "Firebase DB가 연결되지 않았습니다."
+        
+        user_id = email.replace("@", "_at_").replace(".", "_dot_")
+        doc_ref = self.db.collection('users').document(user_id)
+
         try:
-            res = requests.post(url, json={"email": email, "password": password, "returnSecureToken": True})
-            data = res.json()
-            if "error" in data:
-                msg = data["error"]["message"]
-                if "Identity Toolkit API has not been used" in msg or "disabled" in msg:
-                    project_id = st.secrets.get("firebase_service_account", {}).get("project_id", "")
-                    link = f"https://console.developers.google.com/apis/api/identitytoolkit.googleapis.com/overview?project={project_id}"
-                    return None, f"🚨 **구글 클라우드 설정 필요**\n\n아래 링크에서 [사용(ENABLE)] 버튼을 눌러주세요.\n[설정 바로가기]({link})"
-                return None, msg
-            return data, None
-        except Exception as e: return None, str(e)
+            doc = doc_ref.get()
+            
+            if mode == "signup":
+                if doc.exists:
+                    return None, "이미 존재하는 이메일입니다."
+                doc_ref.set({"password": password, "email": email, "created_at": firestore.SERVER_TIMESTAMP})
+                return {"localId": user_id, "email": email}, None
+            
+            elif mode == "login":
+                if not doc.exists:
+                    return None, "존재하지 않는 사용자입니다."
+                user_data = doc.to_dict()
+                if user_data.get("password") == password:
+                    return {"localId": user_id, "email": email}, None
+                else:
+                    return None, "비밀번호가 틀렸습니다."
+        except Exception as e:
+            return None, str(e)
 
     def save_profile(self, profile_data, imgs_b64):
         if self.is_initialized and st.session_state.user:
@@ -300,7 +310,9 @@ def route_intent(user_input):
     """
     res = run_with_retry(lambda: llm.invoke(prompt).content.strip())
     try:
-        if "[" in res and "]" in res: return ast.literal_eval(res)
+        # 응답이 리스트 형태 문자열인지 확인하고 파싱
+        if "[" in res and "]" in res:
+            return ast.literal_eval(res)
         return [res]
     except: return ["CHAT"]
 
@@ -313,8 +325,10 @@ with st.sidebar:
     # 로그인
     if st.session_state.user:
         st.success(f"**{st.session_state.user['email']}**님")
+        # 로그아웃 시 확실한 초기화
         if st.button("로그아웃", use_container_width=True):
-            st.session_state.clear()
+            for key in list(st.session_state.keys()):
+                del st.session_state[key]
             st.rerun()
     else:
         with st.expander("🔐 로그인 / 회원가입", expanded=True):
@@ -325,21 +339,19 @@ with st.sidebar:
                 user, err = fb_manager.auth_user(email, pw, "login")
                 if user:
                     st.session_state.user = user
-                    # 로그인 시 프로필 로드 및 세션/위젯 상태 동기화
                     saved = fb_manager.load_profile()
                     if saved:
                         st.session_state.user_profile.update(saved)
                         if 'grade_card_img' in saved:
                             st.session_state.grade_card_img = saved['grade_card_img']
                         
-                        # [핵심] 위젯 키값 강제 업데이트
+                        # 위젯 키값 업데이트
                         if "major" in saved: st.session_state.agent_major = saved["major"]
                         if "grade" in saved: st.session_state.agent_grade = saved["grade"]
                         if "semester" in saved: st.session_state.agent_sem = saved["semester"]
                         if "credit" in saved: st.session_state.agent_credit = saved["credit"]
                         if "requirements" in saved: st.session_state.agent_reqs = saved["requirements"]
                         
-                        # 공강 체크박스 동기화
                         blocked_days = saved.get("blocked_days", [])
                         for d in ["월", "화", "수", "목", "금"]:
                             st.session_state[f"chk_{d}"] = (d not in blocked_days)
@@ -352,41 +364,49 @@ with st.sidebar:
                     st.session_state.user = user
                     st.rerun()
                 else: st.error(err)
-    
+
     st.divider()
     
     # 내 정보 설정
     st.subheader("📝 내 학사 정보 설정")
     st.caption("이 정보는 시간표, 졸업진단, 질문 답변 시 AI가 참고합니다.")
     
-    kw_depts = ["선택해주세요", "전자융합공학과", "전자공학과", "컴퓨터정보공학부", "소프트웨어학부", "정보융합학부", "경영학부"]
+    # 광운대학교 전체 학과 리스트
+    kw_depts = [
+        "선택해주세요",
+        "전자공학과", "전자통신공학과", "전자융합공학과", "전기공학과", "전자재료공학과", "로봇학부",
+        "컴퓨터정보공학부", "소프트웨어학부", "정보융합학부",
+        "건축공학과", "건축학과(5년제)", "화학공학과", "환경공학과",
+        "수학과", "전자바이오물리학과", "화학과", "스포츠융합과학과", "정보콘텐츠학과(야)",
+        "국어국문학과", "영어산업학과", "미디어커뮤니케이션학부", "산업심리학과", "동북아문화산업학부",
+        "행정학과", "법학부", "국제학부", "자산관리학과(야)",
+        "경영학부", "국제통상학부"
+    ]
     
-    # 세션 값으로 초기값 설정
     p = st.session_state.user_profile
     
-    # 인덱스 에러 방지
     major_idx = kw_depts.index(p["major"]) if p["major"] in kw_depts else 0
     major = st.selectbox("학과", kw_depts, index=major_idx, key="agent_major")
     
-    c1, c2 = st.columns(2)
     grades = ["선택해주세요", "1학년", "2학년", "3학년", "4학년"]
     semesters = ["선택해주세요", "1학기", "2학기"]
     
+    # 글자 잘림 방지를 위해 컬럼 제거하고 세로 배치
     grade_idx = grades.index(p["grade"]) if p["grade"] in grades else 0
-    sem_idx = semesters.index(p["semester"]) if p["semester"] in semesters else 0
+    grade = st.selectbox("학년", grades, index=grade_idx, key="agent_grade")
     
-    grade = c1.selectbox("학년", grades, index=grade_idx, key="agent_grade")
-    semester = c2.selectbox("학기", semesters, index=sem_idx, key="agent_sem")
+    sem_idx = semesters.index(p["semester"]) if p["semester"] in semesters else 0
+    semester = st.selectbox("학기", semesters, index=sem_idx, key="agent_sem")
     
     credit = st.number_input("목표 학점", 0, 24, p["credit"], key="agent_credit")
     reqs = st.text_area("요구사항", value=p["requirements"], key="agent_reqs")
     
     with st.popover("공강 요일 설정"):
+        st.info("체크 해제 = 공강")
         days = ["월", "화", "수", "목", "금"]
         new_blocked = []
         cols = st.columns(5)
         for i, d in enumerate(days):
-            # p["blocked_days"]에 있으면 체크 해제 상태
             is_checked = d not in p["blocked_days"]
             if not cols[i].checkbox(d, value=is_checked, key=f"chk_{d}"):
                 new_blocked.append(d)
@@ -421,8 +441,8 @@ with st.sidebar:
     st.divider()
 
     # 히스토리 & 보관함
-    t1, t2 = st.tabs(["🗂️ 히스토리", "⭐ 보관함"])
-    with t1:
+    tab1, tab2 = st.tabs(["🗂️ 히스토리", "⭐ 보관함"])
+    with tab1:
         if st.session_state.user:
             for h in fb_manager.load_chat_history_list():
                 dt = h['updated_at'].strftime('%m/%d %H:%M') if h.get('updated_at') else ""
@@ -431,7 +451,7 @@ with st.sidebar:
                     st.rerun()
         else: st.caption("로그인 필요")
         
-    with t2:
+    with tab2:
         if st.session_state.user:
             for b in fb_manager.load_bookmarks():
                 with st.expander(f"📌 {b.get('note', '항목')}"):
@@ -518,4 +538,3 @@ else:
             fb_manager.save_chat_session(st.session_state.session_id, st.session_state.current_chat, summary=prompt[:15])
         
         st.rerun()
-
