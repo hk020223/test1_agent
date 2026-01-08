@@ -84,12 +84,15 @@ def clean_html_output(text):
 
 # 재시도 로직 (429 에러 대응 - 즉시 알림)
 def run_with_retry(func, *args, **kwargs):
-    try:
-        return func(*args, **kwargs)
-    except Exception as e:
-        if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
-            return "⚠️ **사용량 초과**: 현재 AI 요청량이 많아 처리가 불가능합니다. 잠시 후(약 1분 뒤) 다시 질문해 주세요."
-        raise e
+    max_retries = 3
+    for i in range(max_retries):
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
+                return "⚠️ **사용량 초과**: 현재 AI 요청량이 많아 처리가 불가능합니다. 잠시 후(약 1분 뒤) 다시 질문해 주세요."
+            raise e
+    return "⚠️ 처리 실패: 다시 시도해주세요."
 
 # -----------------------------------------------------------------------------
 # [Firebase Manager]
@@ -111,40 +114,35 @@ class FirebaseManager:
                 self.is_initialized = True
             except: pass
 
-    # Firestore를 이용한 자체 간편 인증
     def auth_user(self, email, password, mode="login"):
-        if not self.is_initialized:
-            return None, "Firebase DB가 연결되지 않았습니다."
-        
+        if not self.is_initialized: return None, "DB 미연결"
         user_id = email.replace("@", "_at_").replace(".", "_dot_")
         doc_ref = self.db.collection('users').document(user_id)
-
         try:
             doc = doc_ref.get()
-            
             if mode == "signup":
-                if doc.exists:
-                    return None, "이미 존재하는 이메일입니다."
+                if doc.exists: return None, "이미 존재하는 이메일입니다."
                 doc_ref.set({"password": password, "email": email, "created_at": firestore.SERVER_TIMESTAMP})
                 return {"localId": user_id, "email": email}, None
-            
             elif mode == "login":
-                if not doc.exists:
-                    return None, "존재하지 않는 사용자입니다."
+                if not doc.exists: return None, "존재하지 않는 사용자입니다."
                 user_data = doc.to_dict()
                 if user_data.get("password") == password:
                     return {"localId": user_id, "email": email}, None
-                else:
-                    return None, "비밀번호가 틀렸습니다."
-        except Exception as e:
-            return None, str(e)
+                else: return None, "비밀번호 오류"
+        except Exception as e: return None, str(e)
 
-    def save_profile(self, profile_data):
+    def save_profile(self, profile_data, imgs_b64):
         if self.is_initialized and st.session_state.user:
             try:
                 uid = st.session_state.user['localId']
-                self.db.collection('users').document(uid).collection('profile').document('info').set(profile_data)
-            except: pass
+                data = profile_data.copy()
+                if imgs_b64:
+                    data['grade_card_img'] = imgs_b64 
+                self.db.collection('users').document(uid).collection('profile').document('info').set(data)
+                return True
+            except: return False
+        return False
 
     def load_profile(self):
         if self.is_initialized and st.session_state.user:
@@ -199,15 +197,17 @@ class FirebaseManager:
 fb_manager = FirebaseManager()
 
 # -----------------------------------------------------------------------------
-# [Session & Data]
+# [Session State] 초기화
 # -----------------------------------------------------------------------------
 if "user" not in st.session_state: st.session_state.user = None
 if "current_chat" not in st.session_state: st.session_state.current_chat = []
 if "session_id" not in st.session_state: st.session_state.session_id = str(uuid.uuid4())
+
+# 초기값을 빈 값으로 설정
 if "user_profile" not in st.session_state:
     st.session_state.user_profile = {
-        "major": "전자융합공학과", "grade": "1학년", "semester": "1학기", 
-        "credit": 18, "requirements": "", "blocked_days": []
+        "major": "선택해주세요", "grade": "선택해주세요", "semester": "선택해주세요", 
+        "credit": 0, "requirements": "", "blocked_days": []
     }
 if "grade_card_img" not in st.session_state: st.session_state.grade_card_img = []
 if "timetable_data" not in st.session_state: st.session_state.timetable_data = ""
@@ -278,10 +278,10 @@ def tool_generate_timetable(profile, extra_req=""):
 # 3. 졸업 진단
 def tool_audit_graduation(profile, images_b64):
     if not images_b64:
-        return "🎓 졸업 진단을 위해 사이드바에서 성적표 이미지를 업로드해주세요."
+        return "⚠️ 저장된 성적표 이미지가 없습니다. 사이드바에서 업로드해주세요."
     
     llm = get_llm()
-    img_content = [{"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img}"}} for img in images_b64]
+    image_content = [{"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img}"}} for img in images_b64]
     
     prompt_text = f"""
     학생: {profile['major']} {profile['grade']}
@@ -303,7 +303,6 @@ def route_intent(user_input):
     """
     res = run_with_retry(lambda: llm.invoke(prompt).content.strip())
     try:
-        # 응답이 리스트 형태 문자열인지 확인하고 파싱
         if "[" in res and "]" in res:
             return ast.literal_eval(res)
         return [res]
@@ -318,9 +317,7 @@ with st.sidebar:
     # 로그인
     if st.session_state.user:
         st.success(f"**{st.session_state.user['email']}**님")
-        # [수정] 로그아웃 시 확실한 초기화
         if st.button("로그아웃", use_container_width=True):
-            st.session_state.user = None
             st.session_state.clear()
             st.rerun()
     else:
@@ -333,7 +330,10 @@ with st.sidebar:
                 if user:
                     st.session_state.user = user
                     saved = fb_manager.load_profile()
-                    if saved: st.session_state.user_profile.update(saved)
+                    if saved:
+                        st.session_state.user_profile.update(saved)
+                        if 'grade_card_img' in saved:
+                            st.session_state.grade_card_img = saved['grade_card_img']
                     st.rerun()
                 else: st.error(err)
             if col_l2.button("가입"):
@@ -342,30 +342,35 @@ with st.sidebar:
                     st.session_state.user = user
                     st.rerun()
                 else: st.error(err)
-    
+
     st.divider()
     
     # 내 정보 설정
-    st.subheader("📅 시간표 및 학사 설정")
+    st.subheader("📝 내 학사 정보 설정")
     st.caption("이 정보는 시간표, 졸업진단, 질문 답변 시 AI가 참고합니다.")
     
-    kw_depts = [
-        "전자융합공학과", "전자공학과", "전자통신공학과", "전기공학과", "전자재료공학과", "로봇학부",
-        "컴퓨터정보공학부", "소프트웨어학부", "정보융합학부", "건축학과", "건축공학과", "화학공학과", "환경공학과",
-        "국어국문학과", "영어영문학과", "미디어커뮤니케이션학부", "산업심리학과", "동북아문화산업학부",
-        "행정학과", "법학부", "국제학부", "경영학부", "국제통상학부"
-    ]
+    kw_depts = ["선택해주세요", "전자융합공학과", "전자공학과", "컴퓨터정보공학부", "소프트웨어학부", "정보융합학부", "경영학부"]
     
     p = st.session_state.user_profile
-    major = st.selectbox("학과", kw_depts, index=kw_depts.index(p["major"]) if p["major"] in kw_depts else 0, key="agent_major")
-    col1, col2 = st.columns(2)
-    grade = col1.selectbox("학년", ["1학년", "2학년", "3학년", "4학년"], index=["1학년", "2학년", "3학년", "4학년"].index(p["grade"]), key="agent_grade")
-    semester = col2.selectbox("학기", ["1학기", "2학기"], index=["1학기", "2학기"].index(p["semester"]), key="agent_sem")
-    credit = st.number_input("목표 학점", 9, 24, p["credit"], key="agent_credit")
-    reqs = st.text_area("추가 요구사항 (예: 오전 수업 X)", value=p["requirements"], key="agent_reqs")
     
-    with st.popover("공강 요일/시간 설정"):
-        st.info("체크 해제 = 공강")
+    # 인덱스 에러 방지
+    major_idx = kw_depts.index(p["major"]) if p["major"] in kw_depts else 0
+    major = st.selectbox("학과", kw_depts, index=major_idx, key="agent_major")
+    
+    c1, c2 = st.columns(2)
+    grades = ["선택해주세요", "1학년", "2학년", "3학년", "4학년"]
+    semesters = ["선택해주세요", "1학기", "2학기"]
+    
+    grade_idx = grades.index(p["grade"]) if p["grade"] in grades else 0
+    sem_idx = semesters.index(p["semester"]) if p["semester"] in semesters else 0
+    
+    grade = c1.selectbox("학년", grades, index=grade_idx, key="agent_grade")
+    semester = c2.selectbox("학기", semesters, index=sem_idx, key="agent_sem")
+    
+    credit = st.number_input("목표 학점", 0, 24, p["credit"], key="agent_credit")
+    reqs = st.text_area("요구사항", value=p["requirements"], key="agent_reqs")
+    
+    with st.popover("공강 요일 설정"):
         days = ["월", "화", "수", "목", "금"]
         new_blocked = []
         cols = st.columns(5)
@@ -380,27 +385,32 @@ with st.sidebar:
             "credit": credit, "requirements": reqs, "blocked_days": new_blocked
         }
         if st.session_state.user:
-            fb_manager.save_profile(st.session_state.user_profile)
+            fb_manager.save_profile(st.session_state.user_profile, st.session_state.grade_card_img)
         st.success("저장됨!")
     
     st.divider()
     
-    # 자료 제출
-    st.subheader("📄 성적표 업로드")
-    uploaded_imgs = st.file_uploader("졸업 진단용 이미지", type=['png', 'jpg'], accept_multiple_files=True)
+    # 성적표
+    st.subheader("📄 성적표")
+    if st.session_state.grade_card_img:
+        st.info(f"✅ {len(st.session_state.grade_card_img)}장의 성적표가 저장되어 있습니다.")
+    else:
+        st.caption("저장된 성적표가 없습니다.")
+
+    uploaded_imgs = st.file_uploader("새로 업로드 (기존 파일 덮어씀)", type=['png', 'jpg'], accept_multiple_files=True)
     if uploaded_imgs:
         imgs_b64 = []
         for img in uploaded_imgs:
             img_bytes = img.read()
             imgs_b64.append(base64.b64encode(img_bytes).decode('utf-8'))
         st.session_state.grade_card_img = imgs_b64
-        st.success(f"{len(imgs_b64)}장 준비됨")
+        st.success("업로드 완료! (설정 저장을 눌러주세요)")
 
     st.divider()
 
-    # 히스토리 & 보관함 탭 (변수명 수정: t1, t2 -> tab1, tab2)
-    tab1, tab2 = st.tabs(["🗂️ 히스토리", "⭐ 보관함"])
-    with tab1:
+    # 히스토리 & 보관함
+    t1, t2 = st.tabs(["🗂️ 히스토리", "⭐ 보관함"])
+    with t1:
         if st.session_state.user:
             for h in fb_manager.load_chat_history_list():
                 dt = h['updated_at'].strftime('%m/%d %H:%M') if h.get('updated_at') else ""
@@ -409,7 +419,7 @@ with st.sidebar:
                     st.rerun()
         else: st.caption("로그인 필요")
         
-    with tab2:
+    with t2:
         if st.session_state.user:
             for b in fb_manager.load_bookmarks():
                 with st.expander(f"📌 {b.get('note', '항목')}"):
@@ -417,61 +427,82 @@ with st.sidebar:
                     else: st.markdown(b['content'])
         else: st.caption("로그인 필요")
 
-# 메인 채팅창
+# -----------------------------------------------------------------------------
+# [Main] 채팅 인터페이스
+# -----------------------------------------------------------------------------
 st.title("🎓 KW-강의마스터 AI")
-st.caption(f"**{st.session_state.user_profile['major']} {st.session_state.user_profile['grade']}**님, 무엇을 도와드릴까요?")
 
-for msg in st.session_state.current_chat:
-    with st.chat_message(msg["role"]):
-        if msg.get("type") == "html": st.markdown(msg["content"], unsafe_allow_html=True)
-        else: st.markdown(msg["content"])
-        
-        if msg["role"] == "assistant" and st.session_state.user:
-            k = f"save_{hash(str(msg['content']))}"
-            if st.button("💾 저장", key=k):
-                note = "시간표" if msg.get("type") == "html" else "답변"
-                fb_manager.add_bookmark(msg.get("type", "text"), msg["content"], note)
-                st.toast("저장됨!")
+# 초기값 미설정 시 블라인드 처리
+profile = st.session_state.user_profile
+if profile["major"] == "선택해주세요" or profile["grade"] == "선택해주세요":
+    st.warning("👈 왼쪽 사이드바에서 **학과와 학년**을 먼저 설정해주세요.")
+    st.info("로그인하시면 저장된 설정을 불러올 수 있습니다.")
+else:
+    st.caption(f"**{profile['major']} {profile['grade']}**님, 무엇을 도와드릴까요?")
 
-if prompt := st.chat_input("예: 1학년 시간표 짜줘, 졸업 요건 봐줘"):
-    st.session_state.current_chat.append({"role": "user", "content": prompt})
-    with st.chat_message("user"): st.markdown(prompt)
-
-    with st.chat_message("assistant"):
-        with st.spinner("생각 중..."):
-            profile = st.session_state.user_profile
-            intents = route_intent(prompt)
+    # 대화 내용 출력
+    for msg in st.session_state.current_chat:
+        with st.chat_message(msg["role"]):
+            if msg.get("type") == "html": st.markdown(msg["content"], unsafe_allow_html=True)
+            else: st.markdown(msg["content"])
             
-            if isinstance(intents, str): intents = [intents]
+            if msg["role"] == "assistant" and st.session_state.user:
+                k = f"save_{hash(str(msg['content']))}"
+                if st.button("💾 저장", key=k):
+                    note = "시간표" if msg.get("type") == "html" else "답변"
+                    fb_manager.add_bookmark(msg.get("type", "text"), msg["content"], note)
+                    st.toast("저장됨!")
 
-            for intent in intents:
-                res_con, res_type = "", "text"
+    # 사용자 입력 처리
+    if prompt := st.chat_input("예: 1학년 시간표 짜줘, 졸업 요건 봐줘"):
+        st.session_state.current_chat.append({"role": "user", "content": prompt})
+        with st.chat_message("user"): st.markdown(prompt)
+
+        with st.chat_message("assistant"):
+            # 에이전트 사고 과정 시각화 (Status Container)
+            with st.status("🤖 AI가 작업을 계획하고 있습니다...", expanded=True) as status:
                 
-                if intent == "QA":
-                    res_con = tool_qa(prompt, profile)
-                    st.markdown(res_con)
-                elif intent == "TIMETABLE":
-                    st.info("📅 시간표 생성 중...")
-                    extra = prompt if "수정" in prompt or "빼줘" in prompt else ""
-                    res_con = tool_generate_timetable(profile, extra)
-                    res_type = "html"
-                    st.markdown(res_con, unsafe_allow_html=True)
-                elif intent == "GRADUATION":
-                    st.info("🎓 졸업 진단 중...")
-                    if not st.session_state.grade_card_img:
-                         st.warning("성적표 이미지를 먼저 업로드해주세요!")
-                         res_con = "성적표 이미지가 없습니다."
-                    else:
-                        res_con = tool_audit_graduation(profile, st.session_state.grade_card_img)
-                        st.markdown(res_con)
-                else: # CHAT
-                    llm = get_llm()
-                    res_con = run_with_retry(lambda: llm.invoke(f"사용자: {prompt}\n친절한 학사 조교로서 답변해.").content)
-                    st.markdown(res_con)
+                st.write("🔍 사용자의 의도를 분석 중입니다...")
+                intents = route_intent(prompt)
+                if isinstance(intents, str): intents = [intents]
+                st.write(f"👉 작업 분류: {intents}")
                 
-                st.session_state.current_chat.append({"role": "assistant", "content": res_con, "type": res_type})
-    
-    if st.session_state.user:
-        fb_manager.save_chat_session(st.session_state.session_id, st.session_state.current_chat, summary=prompt[:15])
-    
-    st.rerun()
+                for intent in intents:
+                    res_con, res_type = "", "text"
+                    
+                    if intent == "QA":
+                        st.write("📚 학칙 및 요람 문서를 검색 중입니다...")
+                        res_con = tool_qa(prompt, profile)
+                        
+                    elif intent == "TIMETABLE":
+                        st.write("📅 최적의 시간표 조합을 찾고 있습니다...")
+                        extra = prompt if "수정" in prompt or "빼줘" in prompt else ""
+                        res_con = tool_generate_timetable(profile, extra)
+                        res_type = "html"
+                        
+                    elif intent == "GRADUATION":
+                        st.write("🎓 성적표와 졸업 요건을 대조 중입니다...")
+                        if not st.session_state.grade_card_img:
+                             res_con = "⚠️ 성적표 이미지가 없습니다. 사이드바에서 업로드해주세요."
+                        else:
+                            res_con = tool_audit_graduation(profile, st.session_state.grade_card_img)
+                            
+                    else: # CHAT
+                        st.write("💬 답변을 생성 중입니다...")
+                        llm = get_llm()
+                        res_con = run_with_retry(lambda: llm.invoke(f"사용자: {prompt}\n친절한 학사 조교로서 답변해.").content)
+                    
+                    # 상태창 업데이트 완료
+                    status.update(label="완료!", state="complete", expanded=False)
+                    
+                    # 결과 출력
+                    if res_type == "html": st.markdown(res_con, unsafe_allow_html=True)
+                    else: st.markdown(res_con)
+                    
+                    st.session_state.current_chat.append({"role": "assistant", "content": res_con, "type": res_type})
+        
+        # 자동 저장
+        if st.session_state.user:
+            fb_manager.save_chat_session(st.session_state.session_id, st.session_state.current_chat, summary=prompt[:15])
+        
+        st.rerun()
