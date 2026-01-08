@@ -1,0 +1,9 @@
+streamlit
+pandas
+langchain-google-genai
+langchain-community
+langchain-core
+pypdf
+Pillow
+firebase-admin
+requests
