@@ -9,6 +9,7 @@ import json
 import uuid
 import requests
 import ast
+import re
 from PIL import Image
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -76,10 +77,8 @@ def clean_html_output(text):
         cleaned = cleaned[7:]
     elif cleaned.startswith("```"):
         cleaned = cleaned[3:]
-    
     if cleaned.endswith("```"):
         cleaned = cleaned[:-3]
-    
     return cleaned.replace("```html", "").replace("```", "").strip()
 
 # 재시도 로직 (429 에러 대응 - 즉시 알림)
@@ -111,31 +110,22 @@ class FirebaseManager:
                 self.is_initialized = True
             except: pass
 
-    # Firestore를 이용한 자체 간편 인증
     def auth_user(self, email, password, mode="login"):
-        if not self.is_initialized:
-            return None, "Firebase DB가 연결되지 않았습니다."
+        if "FIREBASE_WEB_API_KEY" not in st.secrets:
+            return None, "API Key 설정이 필요합니다."
         
-        user_id = email.replace("@", "_at_").replace(".", "_dot_")
-        doc_ref = self.db.collection('users').document(user_id)
-
+        # 공백 제거
+        web_api_key = st.secrets["FIREBASE_WEB_API_KEY"].strip()
+        
+        endpoint = "signInWithPassword" if mode == "login" else "signUp"
+        url = f"https://identitytoolkit.googleapis.com/v1/accounts:{endpoint}?key={api_key}"
+        
         try:
-            doc = doc_ref.get()
-            
-            if mode == "signup":
-                if doc.exists:
-                    return None, "이미 존재하는 이메일입니다."
-                doc_ref.set({"password": password, "email": email, "created_at": firestore.SERVER_TIMESTAMP})
-                return {"localId": user_id, "email": email}, None
-            
-            elif mode == "login":
-                if not doc.exists:
-                    return None, "존재하지 않는 사용자입니다."
-                user_data = doc.to_dict()
-                if user_data.get("password") == password:
-                    return {"localId": user_id, "email": email}, None
-                else:
-                    return None, "비밀번호가 틀렸습니다."
+            res = requests.post(url, json={"email": email, "password": password, "returnSecureToken": True})
+            data = res.json()
+            if "error" in data:
+                return None, data["error"]["message"]
+            return data, None
         except Exception as e:
             return None, str(e)
 
@@ -210,7 +200,7 @@ if "user" not in st.session_state: st.session_state.user = None
 if "current_chat" not in st.session_state: st.session_state.current_chat = []
 if "session_id" not in st.session_state: st.session_state.session_id = str(uuid.uuid4())
 
-# 초기값을 빈 값으로 설정 (기본 학점 19로 변경)
+# 초기값을 빈 값으로 설정
 if "user_profile" not in st.session_state:
     st.session_state.user_profile = {
         "major": "선택해주세요", "grade": "선택해주세요", "semester": "선택해주세요", 
@@ -237,7 +227,7 @@ def load_knowledge_base():
 PRE_LEARNED_DATA = load_knowledge_base()
 
 # -----------------------------------------------------------------------------
-# [AI Tools] 에이전트 도구
+# [AI Tools] 에이전트 도구 (Throttling 적용)
 # -----------------------------------------------------------------------------
 def get_llm(model_name="gemini-2.5-flash-preview-09-2025"):
     if not api_key: return None
@@ -245,6 +235,7 @@ def get_llm(model_name="gemini-2.5-flash-preview-09-2025"):
 
 # 1. QA
 def tool_qa(query, profile):
+    time.sleep(2) # [Throttling] 강제 휴식
     llm = get_llm()
     prompt = f"""
     [학생 정보] {profile['major']} {profile['grade']}
@@ -256,6 +247,7 @@ def tool_qa(query, profile):
 
 # 2. 시간표 생성
 def tool_generate_timetable(profile, extra_req=""):
+    time.sleep(2) # [Throttling] 강제 휴식
     llm = get_llm()
     blocked = ", ".join(profile['blocked_days']) + "요일" if profile['blocked_days'] else "없음"
     
@@ -287,6 +279,7 @@ def tool_audit_graduation(profile, images_b64):
     if not images_b64:
         return "⚠️ 저장된 성적표 이미지가 없습니다. 사이드바에서 업로드해주세요."
     
+    time.sleep(2) # [Throttling] 강제 휴식
     llm = get_llm()
     image_content = [{"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img}"}} for img in images_b64]
     
@@ -300,21 +293,38 @@ def tool_audit_graduation(profile, images_b64):
     msg = HumanMessage(content=[{"type": "text", "text": prompt_text}] + image_content)
     return run_with_retry(lambda: llm.invoke([msg]).content)
 
-# 4. 라우터
-def route_intent(user_input):
-    llm = get_llm()
-    prompt = f"""
-    입력: "{user_input}"
-    작업 분류 (TIMETABLE, GRADUATION, QA, CHAT) 중 해당하는 것을 리스트로 출력.
-    예: "다전공 설명하고 시간표 짜줘" -> ["QA", "TIMETABLE"]
-    """
-    res = run_with_retry(lambda: llm.invoke(prompt).content.strip())
-    try:
-        # 응답이 리스트 형태 문자열인지 확인하고 파싱
-        if "[" in res and "]" in res:
-            return ast.literal_eval(res)
-        return [res]
-    except: return ["CHAT"]
+# 4. [최적화] 키워드 기반 라우팅 (API 호출 0회)
+def decide_intent_rule_based(user_input):
+    intents = []
+    text = user_input.replace(" ", "") # 띄어쓰기 무시
+    
+    # 키워드 사전
+    kw_timetable = ["시간표", "짜줘", "만들어", "수정", "빼줘", "넣어줘"]
+    kw_graduation = ["졸업", "학점", "이수", "요건", "진단", "성적"]
+    kw_qa = ["규정", "장학", "재수강", "설명", "알려줘", "뭐야", "?", "기준"]
+    
+    # 1. 졸업 진단
+    if any(k in text for k in kw_graduation):
+        intents.append("GRADUATION")
+    
+    # 2. 시간표 (졸업 진단과 함께 요청 가능)
+    if any(k in text for k in kw_timetable):
+        intents.append("TIMETABLE")
+        
+    # 3. QA (설명 요청이 포함된 경우)
+    if any(k in text for k in kw_qa):
+        # 시간표나 졸업과 같이 묻는 경우 QA를 먼저 수행
+        if "TIMETABLE" in intents or "GRADUATION" in intents:
+            if "설명" in text or "규정" in text:
+                intents.insert(0, "QA")
+        else:
+            intents.append("QA")
+            
+    # 아무것도 없으면 잡담
+    if not intents:
+        intents.append("CHAT")
+        
+    return list(dict.fromkeys(intents)) # 중복 제거
 
 # -----------------------------------------------------------------------------
 # [UI] 사이드바 및 메인
@@ -327,8 +337,8 @@ with st.sidebar:
         st.success(f"**{st.session_state.user['email']}**님")
         # 로그아웃 시 확실한 초기화
         if st.button("로그아웃", use_container_width=True):
-            for key in list(st.session_state.keys()):
-                del st.session_state[key]
+            st.session_state.user = None
+            st.session_state.clear()
             st.rerun()
     else:
         with st.expander("🔐 로그인 / 회원가입", expanded=True):
@@ -371,38 +381,28 @@ with st.sidebar:
     st.subheader("📝 내 학사 정보 설정")
     st.caption("이 정보는 시간표, 졸업진단, 질문 답변 시 AI가 참고합니다.")
     
-    # 광운대학교 전체 학과 리스트
-    kw_depts = [
-        "선택해주세요",
-        "전자공학과", "전자통신공학과", "전자융합공학과", "전기공학과", "전자재료공학과", "로봇학부",
-        "컴퓨터정보공학부", "소프트웨어학부", "정보융합학부",
-        "건축공학과", "건축학과(5년제)", "화학공학과", "환경공학과",
-        "수학과", "전자바이오물리학과", "화학과", "스포츠융합과학과", "정보콘텐츠학과(야)",
-        "국어국문학과", "영어산업학과", "미디어커뮤니케이션학부", "산업심리학과", "동북아문화산업학부",
-        "행정학과", "법학부", "국제학부", "자산관리학과(야)",
-        "경영학부", "국제통상학부"
-    ]
+    kw_depts = ["선택해주세요", "전자융합공학과", "전자공학과", "컴퓨터정보공학부", "소프트웨어학부", "정보융합학부", "경영학부"]
     
     p = st.session_state.user_profile
     
+    # 인덱스 에러 방지
     major_idx = kw_depts.index(p["major"]) if p["major"] in kw_depts else 0
     major = st.selectbox("학과", kw_depts, index=major_idx, key="agent_major")
     
+    c1, c2 = st.columns(2)
     grades = ["선택해주세요", "1학년", "2학년", "3학년", "4학년"]
     semesters = ["선택해주세요", "1학기", "2학기"]
     
-    # 글자 잘림 방지를 위해 컬럼 제거하고 세로 배치
     grade_idx = grades.index(p["grade"]) if p["grade"] in grades else 0
-    grade = st.selectbox("학년", grades, index=grade_idx, key="agent_grade")
-    
     sem_idx = semesters.index(p["semester"]) if p["semester"] in semesters else 0
+    
+    grade = st.selectbox("학년", grades, index=grade_idx, key="agent_grade")
     semester = st.selectbox("학기", semesters, index=sem_idx, key="agent_sem")
     
     credit = st.number_input("목표 학점", 0, 24, p["credit"], key="agent_credit")
     reqs = st.text_area("요구사항", value=p["requirements"], key="agent_reqs")
     
     with st.popover("공강 요일 설정"):
-        st.info("체크 해제 = 공강")
         days = ["월", "화", "수", "목", "금"]
         new_blocked = []
         cols = st.columns(5)
@@ -491,43 +491,41 @@ else:
         with st.chat_message("user"): st.markdown(prompt)
 
         with st.chat_message("assistant"):
-            # 에이전트 사고 과정 시각화 (Status Container)
-            with st.status("🤖 AI가 작업을 계획하고 있습니다...", expanded=True) as status:
-                
-                st.write("🔍 사용자의 의도를 분석 중입니다...")
-                intents = route_intent(prompt)
-                if isinstance(intents, str): intents = [intents]
-                st.write(f"👉 작업 분류: {intents}")
+            # [수정] 최적화된 라우팅 로직 (API 호출 없음)
+            intents = decide_intent_rule_based(prompt)
+            
+            # 진행 상황 시각화
+            with st.status(f"🤖 {intents[0]} 작업을 준비 중입니다...", expanded=True) as status:
+                st.write(f"📋 작업 목록: {intents}")
                 
                 for intent in intents:
                     res_con, res_type = "", "text"
                     
                     if intent == "QA":
-                        st.write("📚 학칙 및 요람 문서를 검색 중입니다...")
+                        st.write("📚 문서를 검색하고 있습니다...")
                         res_con = tool_qa(prompt, profile)
                         
                     elif intent == "TIMETABLE":
-                        st.write("📅 최적의 시간표 조합을 찾고 있습니다...")
+                        st.write("📅 시간표를 생성하고 있습니다...")
                         extra = prompt if "수정" in prompt or "빼줘" in prompt else ""
                         res_con = tool_generate_timetable(profile, extra)
                         res_type = "html"
                         
                     elif intent == "GRADUATION":
-                        st.write("🎓 성적표와 졸업 요건을 대조 중입니다...")
+                        st.write("🎓 성적표를 분석하고 있습니다...")
                         if not st.session_state.grade_card_img:
                              res_con = "⚠️ 성적표 이미지가 없습니다. 사이드바에서 업로드해주세요."
                         else:
                             res_con = tool_audit_graduation(profile, st.session_state.grade_card_img)
                             
                     else: # CHAT
-                        st.write("💬 답변을 생성 중입니다...")
+                        st.write("💬 답변을 작성 중입니다...")
                         llm = get_llm()
                         res_con = run_with_retry(lambda: llm.invoke(f"사용자: {prompt}\n친절한 학사 조교로서 답변해.").content)
                     
-                    # 상태창 업데이트 완료
+                    # 상태창 업데이트 및 결과 출력
                     status.update(label="완료!", state="complete", expanded=False)
                     
-                    # 결과 출력
                     if res_type == "html": st.markdown(res_con, unsafe_allow_html=True)
                     else: st.markdown(res_con)
                     
