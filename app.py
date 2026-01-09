@@ -77,8 +77,10 @@ def clean_html_output(text):
         cleaned = cleaned[7:]
     elif cleaned.startswith("```"):
         cleaned = cleaned[3:]
+    
     if cleaned.endswith("```"):
         cleaned = cleaned[:-3]
+    
     return cleaned.replace("```html", "").replace("```", "").strip()
 
 # 재시도 로직 (429 에러 대응 - 즉시 알림)
@@ -91,7 +93,7 @@ def run_with_retry(func, *args, **kwargs):
         raise e
 
 # -----------------------------------------------------------------------------
-# [Firebase Manager]
+# [Firebase Manager] (Identity Toolkit 제거 -> Firestore 직접 인증)
 # -----------------------------------------------------------------------------
 class FirebaseManager:
     def __init__(self):
@@ -110,22 +112,37 @@ class FirebaseManager:
                 self.is_initialized = True
             except: pass
 
+    # [수정됨] Firestore를 이용한 자체 간편 인증 (API 키 필요 없음)
     def auth_user(self, email, password, mode="login"):
-        if "FIREBASE_WEB_API_KEY" not in st.secrets:
-            return None, "API Key 설정이 필요합니다."
+        if not self.is_initialized:
+            return None, "Firebase DB가 연결되지 않았습니다."
         
-        # 공백 제거
-        web_api_key = st.secrets["FIREBASE_WEB_API_KEY"].strip()
-        
-        endpoint = "signInWithPassword" if mode == "login" else "signUp"
-        url = f"https://identitytoolkit.googleapis.com/v1/accounts:{endpoint}?key={api_key}"
-        
+        # 이메일을 문서 ID로 사용하기 위해 특수문자 처리
+        user_id = email.replace("@", "_at_").replace(".", "_dot_")
+        doc_ref = self.db.collection('users').document(user_id)
+
         try:
-            res = requests.post(url, json={"email": email, "password": password, "returnSecureToken": True})
-            data = res.json()
-            if "error" in data:
-                return None, data["error"]["message"]
-            return data, None
+            doc = doc_ref.get()
+            
+            if mode == "signup":
+                if doc.exists:
+                    return None, "이미 존재하는 이메일입니다."
+                # 회원가입: 비밀번호 저장 (실제 서비스에선 해싱 필요하지만 여기선 평문 저장)
+                doc_ref.set({
+                    "password": password, 
+                    "email": email, 
+                    "created_at": firestore.SERVER_TIMESTAMP
+                })
+                return {"localId": user_id, "email": email}, None
+            
+            elif mode == "login":
+                if not doc.exists:
+                    return None, "존재하지 않는 사용자입니다."
+                user_data = doc.to_dict()
+                if user_data.get("password") == password:
+                    return {"localId": user_id, "email": email}, None
+                else:
+                    return None, "비밀번호가 틀렸습니다."
         except Exception as e:
             return None, str(e)
 
@@ -385,7 +402,6 @@ with st.sidebar:
     
     p = st.session_state.user_profile
     
-    # 인덱스 에러 방지
     major_idx = kw_depts.index(p["major"]) if p["major"] in kw_depts else 0
     major = st.selectbox("학과", kw_depts, index=major_idx, key="agent_major")
     
@@ -491,12 +507,12 @@ else:
         with st.chat_message("user"): st.markdown(prompt)
 
         with st.chat_message("assistant"):
-            # [수정] 최적화된 라우팅 로직 (API 호출 없음)
-            intents = decide_intent_rule_based(prompt)
-            
-            # 진행 상황 시각화
-            with st.status(f"🤖 {intents[0]} 작업을 준비 중입니다...", expanded=True) as status:
-                st.write(f"📋 작업 목록: {intents}")
+            # 에이전트 사고 과정 시각화 (Status Container)
+            with st.status("🤖 AI가 작업을 계획하고 있습니다...", expanded=True) as status:
+                
+                st.write("🔍 사용자의 의도를 분석 중입니다...")
+                intents = decide_intent_rule_based(prompt)
+                st.write(f"👉 작업 분류: {intents}")
                 
                 for intent in intents:
                     res_con, res_type = "", "text"
@@ -523,7 +539,7 @@ else:
                         llm = get_llm()
                         res_con = run_with_retry(lambda: llm.invoke(f"사용자: {prompt}\n친절한 학사 조교로서 답변해.").content)
                     
-                    # 상태창 업데이트 및 결과 출력
+                    # 상태창 업데이트 완료
                     status.update(label="완료!", state="complete", expanded=False)
                     
                     if res_type == "html": st.markdown(res_con, unsafe_allow_html=True)
